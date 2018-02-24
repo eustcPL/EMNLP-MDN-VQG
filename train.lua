@@ -43,6 +43,8 @@ cmd:option('-input_json','data/coco_data_prepro.json','path to the json file con
 -- Data input settings
 cmd:option('-knn_idx_value_train_input', 'data/knn/knn_trainvalid_idx_file_transpose.h5', 'knn_idx_value_train_input')
 cmd:option('-knn_idx_value_test_input', 'data/knn/knn_test_idx_file_transpose.h5', ' knn_idx_value_test_input')
+-- cmd:option('-input_cap_train_h5','data/cap_train_fc7.h5','path to the h5file containing the image feature')
+-- cmd:option('-input_cap_test_h5','data/cap_test_fc7.h5','path to the h5file containing the image feature')
 
 cmd:option('-start_from', '', 'path to a model checkpoint to initialize model weights from. Empty = don\'t')
 cmd:option('-feature_type', 'VGG', 'VGG or Residual')
@@ -180,7 +182,7 @@ end
 ---------------------------------------------------------------------------------------------
 -- Encoding Part 
 
-        -- Question feature embedding
+        -- Caption feature embedding
         --protos.emb = nn.emb_net(lmOpt) -- because problem in sharing network
         protos.emb = nn.Sequential()
                 :add(nn.LookupTableMaskZero(lmOpt.vocab_size, lmOpt.input_encoding_size))
@@ -192,19 +194,18 @@ end
 
         -- Image feature embedding
         protos.cnn = nn.Sequential()
-              :add(nn.Linear(4096,opt.input_encoding_size))
-              :add(nn.Tanh())
-              :add(nn.Dropout(0.5))
+                :add(nn.Linear(4096,opt.input_encoding_size))
+                :add(nn.Tanh())
+                :add(nn.Dropout(0.5))
               
-        -- jointtion feature embedding        
-        protos.joint = nn.Sequential()
-		:add(Multimodal.AcatB(opt.input_encoding_size,opt.input_encoding_size,opt.input_encoding_size,0.5))				
+        -- Fusion feature embedding        
+        protos.fuse = nn.Sequential()
+		            :add(Multimodal.AcatB(opt.input_encoding_size,opt.input_encoding_size,opt.input_encoding_size,0.5))				
                 :add(nn.BatchNormalization(opt.input_encoding_size))
                 :add(nn.Tanh())
                 :add(nn.Dropout(0.5))
                 :add(nn.Linear(opt.input_encoding_size, opt.input_encoding_size))
-		
-		
+		    
 ---------------------------------------------------------------------------------------------
 -- Decoding Part 
 
@@ -223,31 +224,42 @@ if opt.gpuid >= 0 then
   for k,v in pairs(protos) do v:cuda() end
 end
 
+local eparams, grad_eparams = protos.emb:getParameters()
 local cparams, grad_cparams = protos.cnn:getParameters()
+local fparams, grad_fparams = protos.fuse:getParameters()
 local lparams, grad_lparams = protos.lm:getParameters()
 
+eparams:uniform(-0.1, 0.1)
 cparams:uniform(-0.1, 0.1) 
+fparams:uniform(-0.1, 0.1)
 lparams:uniform(-0.1, 0.1) 
 
 if string.len(opt.start_from) > 0 then
   print('Load the weight...')
+  eparams:copy(loaded_checkpoint.eparams)
   cparams:copy(loaded_checkpoint.cparams)
+  fparams:copy(loaded_checkpoint.fparams)
   lparams:copy(loaded_checkpoint.lparams)
 
 end
+
+print('total number of parameters in Question embedding net: ', eparams:nElement())
+assert(eparams:nElement() == grad_eparams:nElement())
 
 print('total number of parameters in Image  embedding net: ', cparams:nElement())
 assert(cparams:nElement() == grad_cparams:nElement())
 
 
+print('total number of parameters in fuse embedding net: ', fparams:nElement())
+assert(fparams:nElement() == grad_fparams:nElement())
+
 print('total number of parameters of language Generating model ', lparams:nElement())
 assert(lparams:nElement() == grad_lparams:nElement())
 
 
+
 collectgarbage() 
----------------------------------------------------------------
--- Clone net  only doing clone
----------------------------------------------------------------
+
 ---------------------------------------------------------------
 -- Triplet net
 ---------------------------------------------------------------
@@ -267,21 +279,14 @@ end
 
 
 local img_TripletNet =  CreateTriplet(protos.cnn)
-local cap_TripletNet =  nn.MapTable():add(protos.emb)
+local cap_TripletNet =  CreateTriplet(protos.emb)
+-- local cap_TripletNet =  nn.MapTable():add(protos.emb)
+local fuse_TripletNet =  CreateTriplet(protos.fuse)
+-- local fuse_TripletNet =  nn.MapTable():add(protos.fuse)
 local triplet_criterion = nn.TripletCriterion()
 ---------------------------------------------------------------
 -- Triplet net
 ---------------------------------------------------------------
--- print '==> protos.atten Network'
--- print(protos.atten)
--- local img_TripletNet = nn.TripletNet(protos.cnn)  --ur not supooose to call getparameter of  original network 
--- local triplet_criterion = nn.DistanceRatioCriterion()
--- if opt.gpuid >= 0 then
---  img_TripletNet:cuda()
---  triplet_criterion:cuda()
--- end
-
-
 print '==> Image Triplet Network'
 print(img_TripletNet)
 print '==> Caption Triplet Network'
@@ -292,8 +297,10 @@ print(triplet_criterion)
 -- Validation evaluation
 -------------------------------------------------------------------------------
 local function eval_split(split)
-	protos.cnn:evaluate()
-	protos.lm:evaluate()
+  protos.emb:evaluate()
+  protos.cnn:evaluate()
+  protos.fuse:evaluate()
+  protos.lm:evaluate()
 	
 	dataloader:resetIterator(2)-- 2 for test and 1 for train
 	
@@ -320,30 +327,28 @@ local function eval_split(split)
         data.caption=batch[4]
         data.ques_id=batch[3]
      -------------------------------------------------------------------------------------
-	n = n + data.images:size(1)
-	xlua.progress(n, total_num)
-      
-      --------------------------------------------------------------------------------------
-      -- origianl question size is 200x26 but caption language module wants question size like 26x200, thats why we did transpose operation.
-      local decode_question=data.questions:t() -- bcz in langauage models checks assert(seq:size(1) == self.seq_length) os it should be 26 x 200
-      -------------------------------------------------------------------------------------------------------------------
-      -- forward the ConvNet on images (most work happens here)
-      local joint_feat=protos.cnn:forward(data.images)
-      --print('img_feat',img_feat:size())--200x512
+      	n = n + data.images:size(1)
+      	xlua.progress(n, total_num)
+    
+        --------------------------------------------------------------------------------------
+        local decode_question=data.questions:t()
+        -------------------------------------------------------------------------------------------------------------------
+        --Forward the Caption word feature through word embedding
+        local cap_feat =protos.emb:forward(data.caption)
 
-      local cap_feat = unpack(protos.emb:forward({data.questions, data.ques_len}))
-
-      local img_feat=protos.cnn:forward(data.images)
+        -- forward the ConvNet on images 
+        local img_feat=protos.cnn:forward(data.images)
 
 
+        --Fusion on Image embedding and Caption Embedding 
+        local fuse_feat = protos.fuse:forward({img_feat,cap_feat})
+
+        -- forward the language model
+        local logprobs = protos.lm:forward({fuse_feat, decode_question}) -- data.questions=data.labels, img_feat=expanded_feats
 
 
-      -- forward the language model
-      local logprobs = protos.lm:forward({joint_feat, decode_question}) -- data.questions=data.labels, img_feat=expanded_feats
-
-
-      -- forward the language model criterion
-      local loss = protos.crit:forward(logprobs, decode_question)
+        -- forward the language model criterion
+        local loss = protos.crit:forward(logprobs, decode_question)
 
         -------------------------------------------------------------------------------------------------------------------
  
@@ -351,11 +356,10 @@ local function eval_split(split)
         loss_evals = loss_evals + 1
 
         -- forward the model to also get generated samples for each image
-        local seq = protos.lm:sample(joint_feat)
+        local seq = protos.lm:sample(fuse_feat)
         local sents = net_utils.decode_sequence(vocab, seq)
         for k=1,#sents do
                 local entry = {image_id = data.ques_id[k], question = sents[k]} -- change here
-                -- print('questions to be written to the val_predictions', sents[k])
                 table.insert(predictions, entry) -- to save all the alements
                 -------------------------------------------------------------------------
                 -- for print log
@@ -364,24 +368,23 @@ local function eval_split(split)
                 end
                 ------------------------------------------------------------------------
         end
-        -- print('length of sents ', #sents) -------checking 
-        if n >= total_num then break end -- this is for complete val example , it should not be more than val total sample. otherwise , repetation example will save in json which will cause error in blue score evalution 
-        if n >= opt.val_images_use then break end -- we've used enough images
+        if n >= total_num then break end 
+        if n >= opt.val_images_use then break end
    
   end
-        ------------------------------------------------------------------------
-        -- for blue,cider score
-        local lang_stats
-        if opt.language_eval == 1 then
-                lang_stats = net_utils.language_eval(predictions, opt.id)
-                local score_statistics = {epoch = epoch, statistics = lang_stats}
-                print('Current language statistics',score_statistics)
-        end
-         ------------------------------------------------------------------------       
-         -- write a (thin) json report-- for save image id and question print in json format
-        local question_filename = string.format('%s/question_checkpoint_epoch%d', opt.checkpoint_dir, epoch)
-        utils.write_json(question_filename .. '.json', predictions) -- for save image id and question print in json format
-        print('wrote json checkpoint to ' .. question_filename .. '.json')
+  ------------------------------------------------------------------------
+  -- for blue,cider score
+  local lang_stats
+  if opt.language_eval == 1 then
+          lang_stats = net_utils.language_eval(predictions, opt.id)
+          local score_statistics = {epoch = epoch, statistics = lang_stats}
+          print('Current language statistics',score_statistics)
+  end
+   ------------------------------------------------------------------------       
+   -- write a (thin) json report-- for save image id and question print in json format
+  local question_filename = string.format('%s/question_checkpoint_epoch%d', opt.checkpoint_dir, epoch)
+  utils.write_json(question_filename .. '.json', predictions) -- for save image id and question print in json format
+  print('wrote json checkpoint to ' .. question_filename .. '.json')
 
 ------------------------------------------------------------------------
   return loss_sum/loss_evals, predictions, lang_stats
@@ -392,106 +395,104 @@ end
 -- Loss function
 -------------------------------------------------------------------------------
 local iter = 0
+local te_optim_state = {}  --- to mentain state in optim
 local tc_optim_state = {}  --- to mentain state in optim
-local function lossFun()
-	protos.cnn:training()
-	protos.lm:training()
+local tf_optim_state = {}  --- to mentain state in optim
 
+local function lossFun()
+
+  protos.emb:training()
+  protos.cnn:training()
+  protos.fuse:training()
+  protos.lm:training()
 ----------------------------------------------------------------------------
--- Forward pass
+-- Get batch of data 
 -----------------------------------------------------------------------------
--- get batch of data  
-	--local data = loader:getBatch{batch_size = opt.batch_size, split = 0}
-	local batch = dataloader:next_batch(opt)        
+        local batch = dataloader:next_batch(opt)        
         local data = {}
-       -- data.answer=batch[3]-- check this in dataloader return sequence
         data.images=batch[1]
         data.questions=batch[2]
         data.caption=batch[3]
-        data.ques_id  = batch[4]
+        data.ques_id= batch[4]
+
         data.images_R=batch[5]
-        data.images_NR=batch[6]
+        data.images_NR=batch[6]        
+
+        data.caption_R=batch[7]
+        data.caption_NR=batch[8]
+-------------------------------------------------------
+        local decode_question= data.questions:t()   
+---------------------------------------------------------------------------------------
+-- Triplet Net Forward pass 
+----------------------------------------------------------------------------------------
+      --Triplet Caption Embedding features 
+        local triplet_cap_emb =cap_TripletNet :forward({data.caption,data.caption_R,data.caption_NR})
+        --Triplet Image Embedding features 
+        local triplet_img_emb =img_TripletNet :forward({data.images,data.images_R,data.images_NR})
+        --Triplet Fusion Embedding features
+        local triplet_fuse_emb =fuse_TripletNet:forward({{triplet_img_emb[1],triplet_cap_emb[1]},{triplet_img_emb[2],triplet_cap_emb[2]},{triplet_img_emb[3],triplet_cap_emb[3]}})
+        -- Triplet loss
+        local triplet_loss=triplet_criterion:forward(triplet_fuse_emb)
+---------------------------------------------------------------------------------------
+-- Triplet Net Backward pass 
+----------------------------------------------------------------------------------------
+      grad_eparams:zero()  
+      grad_cparams:zero() 
+      grad_fparams:zero()  
+      ------------------------------------------------------------------------------------------------------------------------------------
+       local  dtriplet_loss=triplet_criterion:backward(triplet_fuse_emb)
+       local  dtriplet_fuse =fuse_TripletNet:backward({{triplet_img_emb[1],triplet_cap_emb[1]},{triplet_img_emb[2],triplet_cap_emb[2]},{triplet_img_emb[3],triplet_cap_emb[3]}},dtriplet_loss)
+       local dtriplet_img_emb =img_TripletNet:backward({data.images,data.images_R,data.images_NR},{dtriplet_fuse[1][1],dtriplet_fuse[2][1],dtriplet_fuse[3][1]})
+       local dtriplet_cap_emb =cap_TripletNet :backward({data.caption,data.caption_R,data.caption_NR},{dtriplet_fuse[1][2],dtriplet_fuse[2][2],dtriplet_fuse[3][2]})
+      ------------------------------------------------------------------------------------------------------------------------------------
+      -------------------------------------------------------------------------------------
+      --Triplet Net update weight
+      ----------------------------------------------------------------------------------------
+        rmsprop(eparams, grad_eparams, opt.learning_rate, opt.optim_alpha, opt.optim_epsilon, te_optim_state)
+        rmsprop(cparams, grad_cparams, opt.learning_rate, opt.optim_alpha, opt.optim_epsilon, tc_optim_state)
+        rmsprop(fparams, grad_fparams, opt.learning_rate, opt.optim_alpha, opt.optim_epsilon, tf_optim_state)
         
-        data.images_R2=batch[7]
-        data.images_NR2=batch[8]
-	
-
-        local decode_question= data.questions:t()          
- ----------------------------------------------------------------------------
---  Original Encoder Forward pass
+        -- sgdm(eparams, grad_eparams, opt.learning_rate, opt.momentum, te_optim_state)
+        -- sgdm(cparams, grad_cparams, opt.learning_rate, opt.momentum, tc_optim_state) 
+        -- sgdm(fparams, grad_fparams, opt.learning_rate, opt.momentum, tf_optim_state)
+  
+        -----------------------------------------------------------------------------
+----------------------------------------------------------------------------
+--  Main Net Forward pass
 -----------------------------------------------------------------------------
-
-        local cap_feat = unpack(protos.emb:forward({data.caption}))
+        --Forward the Caption word feature through word embedding
+        local cap_feat =protos.emb:forward(data.caption)
 
         -- forward the ConvNet on images 
         local img_feat=protos.cnn:forward(data.images)
 
-        local joint_feat = protos.joint:forward({cap_feat, img_feat})
+
+        --Fusion on Image embedding and Caption Embedding 
+        local fuse_feat = protos.fuse:forward({img_feat,cap_feat})
 
         -- forward the language model
-        local logprobs = protos.lm:forward({joint_feat, decode_question}) -- data.questions=data.labels, img_feat=expanded_feats
+        local logprobs = protos.lm:forward({fuse_feat, decode_question}) -- data.questions=data.labels, img_feat=expanded_feats
 
 
         -- forward the language model criterion
-        local loss = protos.crit:forward(logprobs, decode_question)
-        
-		---------------------------------------------------------------------------------------
-		-- Triplet Net Forward pass 
-		----------------------------------------------------------------------------------------
---------------------------------------------------------------------
-    -- Forward pass 
-    ----------------------------------------------------------------------------------------
-    --Triplet Image Embedding features 
-    local triplet_cap_emb =cap_TripletNet :forward({{data.questions, data.ques_len},{data.questions_R, data.ques_len},{data.questions_NR, data.ques_len}})
-
-    --Triplet Image Embedding features 
-    local triplet_img_emb =img_TripletNet :forward({data.images,data.images_R,data.images_NR})
-    --print('triplet_emb_op',triplet_emb_op)
-
-    local triplet_fuse_emb =fuse_TripletNet:forward({{triplet_cap_emb[1][1],triplet_img_emb[1]},{triplet_cap_emb[2][1],triplet_img_emb[2]},{triplet_cap_emb[3][1],triplet_img_emb[3]}})
-    --print('triplet_fuse_emb',triplet_fuse_emb)
-
-
-    grad_cparams:zero()
-    grad_fparams:zero()
-      ---------------------------------------------------------------------------------------
-      -- Backward pass 
-      ----------------------------------------------------------------------------------------
-      grad_cparams:zero()
-      grad_fparams:zero()
-      ------------------------------------------------------------------------------------------------------------------------------------
-      dtriplet_loss=triplet_criterion:backward(triplet_fuse_emb)
-      -- more detail distandce criteria ref : https://github.com/torch/nn/blob/master/doc/criterion.md#nn.DistanceRatioCriterion
-      --print('dtriplet_loss',dtriplet_loss:size()) --200x2
-      ------------------------------------------------------------------------------------------------------------------------------------
-      dtriplet_atten_op =fuse_TripletNet:backward({{triplet_cap_emb[1][1],triplet_img_emb[1]},{triplet_cap_emb[2][1],triplet_img_emb[2]},{triplet_cap_emb[3][1],triplet_img_emb[3]}},dtriplet_loss)
-      --print('dtriplet_atten_op',dtriplet_atten_op) --got table of 3 table each of 2 tensor
-      dtriplet_img_emb_op =img_emb_TripletNet:backward({data.images,data.images_R,data.images_NR},{dtriplet_atten_op[1][2],dtriplet_atten_op[2][2],dtriplet_atten_op[3][2]})
-      ------------------------------------------------------------------------------------------------------------------------------------
-
-		-------------------------------------------------------------------------------------
-		--Triplet Net update weight
-		----------------------------------------------------------------------------------------
-  rmsprop(aparams, grad_fparams, opt.learning_rate, opt.optim_alpha, opt.optim_epsilon, ta_optim_state)        
+        local loss = protos.crit:forward(logprobs, decode_question)     
 -----------------------------------------------------------------------------
--- Backward pass
+--  Main Net Backward pass
 -----------------------------------------------------------------------------
-	 
-	grad_cparams:zero() 
-	grad_lparams:zero() 
-	
+    grad_eparams:zero()  
+    grad_cparams:zero() 
+    grad_fparams:zero()  
+    grad_lparams:zero() 
+  	
         -- backprop criterion
         local dlogprobs = protos.crit:backward(logprobs, decode_question)
-        
         -- backprop language model
-        local d_lm_feats, ddummy = unpack(protos.lm:backward({joint_feat, decode_question}, dlogprobs))
-        
-        -- backprop the CNN, but only if we are finetuning
+        local d_lm_feats, ddummy = unpack(protos.lm:backward({fuse_feat, decode_question}, dlogprobs))
+        -- backprop the CNN
         local dummy_img_feats = protos.cnn:backward(data.images, d_lm_feats)
-        
-              
+        -- backprop the Caption Embedding
+        local dummy_img_feats = protos.emb:backward(data.images, d_lm_feats)
   -----------------------------------------------------------------------------
-  -- and lets get out!
   local losses = { total_loss = loss,triplet_loss=triplet_loss }
   return losses
 end
@@ -573,16 +574,12 @@ function printlog(epoch,ErrTrain,ErrTest,triplet_error)
 	return 1	
 end
 
-
-
-
-
-
 -------------------------------------------------------------------------------
 --Step 12:--Training Function
 -------------------------------------------------------------------------------
-
+local e_optim_state = {}  --- to mentain state in optim
 local c_optim_state = {}  --- to mentain state in optim
+local f_optim_state = {}  --- to mentain state in optim
 local l_optim_state = {}  --- to mentain state in optim
 
 local grad_clip = 0.1
@@ -626,85 +623,38 @@ function Train()
 			triplet_err_local=0
 			collectgarbage()
 		end
---[[
--- (1) L2 weight decay
-The example code has the following lines for l2 in each batch iteration:
-
-local norm,sign= torch.norm,torch.sign
-f = f + opt.coefL2 * norm(parameters,2)^2/2                                     -- this for display how loss is behaveing 
-gradParameters:add(parameters:clone():mul(opt.coefL2) )                         --how grad paramater is chanaging.
-
---https://groups.google.com/forum/#!topic/torch7/xpSPqkPQm9k
-
--- (2) weight decay
-if wd ~= 0 then
-        dfdx:add(wd, x) --m:add(value, n) puts the result of m=m + value * n .
-end
---https://github.com/torch/optim/blob/master/adam.lua
-
---- (3) - penalties (L1 and L2):
-         --coefL1           (default 0)           L1 penalty on the weights     --0.0005
-         --coefL2           (default 0)           L2 penalty on the weights     --0.0005
-
-
-         if opt.coefL1 ~= 0 or opt.coefL2 ~= 0 then
-            -- locals:
-            local norm,sign= torch.norm,torch.sign
-
-            -- Loss:
-            f = f + opt.coefL1 * norm(parameters,1) --The value of loss is for log, we are not performing any operation on loss, Actually, the opertion is on the gradparameter with help of paramater.
-            f = f + opt.coefL2 * norm(parameters,2)^2/2                         -- this for display how loss is behaveing 
-
-            -- Gradients:
-            gradParameters:add( sign(parameters):mul(opt.coefL1) + parameters:clone():mul(opt.coefL2) ) --how grad paramater is chanaging, this is what actually changing.
-end
---https://github.com/torch/demos/blob/master/train-a-digit-classifier/train-on-mnist.lua#L214
-
--- (4) L1 weight decay
-
-encoder = nn.Sequential() 
-encoder:add(nn.Linear(3, 128))
-encoder:add(nn.Threshold())
-decoder = nn.Linear(128,3)
-
-autoencoder = nn.Sequential()
-autoencoder:add(encoder)
-autoencoder:add(nn.L1Penalty(l1weight)) -- this add value in loss and automatic take care of grad paramater decay
-autoencoder:add(decoder)
-
---http://nn.readthedocs.io/en/rtd/criterion/
-
--- (5) L1 weight decay
-l1_crit = nn.L1Loss(size_average=False)
-reg_loss = 0
-for param in model.parameters():
-    reg_loss += l1_crit(param)
-
-factor = 0.0005
-loss += factor * reg_loss
---https://discuss.pytorch.org/t/simple-l2-regularization/139	
---]]
-	---------------------------------------------------------
-		-- perform a parameter update
-		if opt.optim == 'sgd' then
-			sgdm(cparams, grad_cparams, learning_rate, opt.momentum, c_optim_state)	
-			sgdm(lparams, grad_lparams, learning_rate, opt.momentum, l_optim_state)
-					
-		elseif opt.optim == 'rmsprop' then
-			rmsprop(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, c_optim_state)
-			rmsprop(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, l_optim_state)
-		elseif opt.optim == 'adam' then
-                        adam(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, c_optim_state)
-			adam(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, l_optim_state)
-                elseif opt.optim == 'sgdm' then
-                        sgdm(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, c_optim_state)
-			sgdm(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, l_optim_state)
-                elseif opt.optim == 'sgdmom' then
-                        sgdmom(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, c_optim_state)
-         		sgdmom(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, l_optim_state)
-                elseif opt.optim == 'adagrad' then
-                        adagrad(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, c_optim_state)
-			adagrad(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, l_optim_state)		        				
+		---------------------------------------------------------
+    -- perform a parameter update
+    if opt.optim == 'sgd' then
+      sgdm(eparams, grad_eparams, learning_rate, opt.momentum, e_optim_state)
+      sgdm(cparams, grad_cparams, learning_rate, opt.momentum, c_optim_state) 
+      sgdm(fparams, grad_fparams, learning_rate, opt.momentum, f_optim_state)
+      sgdm(lparams, grad_lparams, learning_rate, opt.momentum, l_optim_state)          
+    elseif opt.optim == 'rmsprop' then
+      rmsprop(eparams, grad_eparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, e_optim_state)
+      rmsprop(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, c_optim_state)
+      rmsprop(fparams, grad_fparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, f_optim_state)
+      rmsprop(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, l_optim_state)
+    elseif opt.optim == 'adam' then
+      adam(eparams, grad_eparams, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, e_optim_state)
+      adam(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, c_optim_state)
+      adam(fparams, grad_fparams, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, f_optim_state)
+      adam(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_beta, opt.optim_epsilon, l_optim_state)
+    elseif opt.optim == 'sgdm' then
+      sgdm(eparams, grad_eparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, e_optim_state)
+      sgdm(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, c_optim_state)
+      sgdm(fparams, grad_fparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, f_optim_state)
+      sgdm(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, l_optim_state)
+    elseif opt.optim == 'sgdmom' then
+      sgdmom(eparams, grad_eparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, e_optim_state)
+      sgdmom(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, c_optim_state)
+      sgdmom(fparams, grad_fparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, f_optim_state)
+      sgdmom(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, l_optim_state)
+    elseif opt.optim == 'adagrad' then
+      adagrad(eparams, grad_eparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, e_optim_state)
+      adagrad(cparams, grad_cparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, c_optim_state)
+      adagrad(fparams, grad_fparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, f_optim_state)
+      adagrad(lparams, grad_lparams, learning_rate, opt.optim_alpha, opt.optim_epsilon, l_optim_state)	        				
 		else
 			error('bad option opt.optim')
 		end
@@ -839,7 +789,7 @@ while epoch ~= opt.epoch do
         ---------------------------------------------------------------------------------------------------------------------------------------------
         local model_save_filename = string.format('%s/model_epoch%d.t7', opt.checkpoint_dir, epoch)
         if epoch % 100==0 then --dont save on very first iteration
-                torch.save(model_save_filename, {cparams=cparams,lparams=lparams, lmOpt=lmOpt})  -- vocabulary mapping is included here, so we can use the checkpoint 
+                torch.save(model_save_filename, {eparams=eparams, cparams=cparams,fparams=fparams,lparams=lparams, lmOpt=lmOpt})  -- vocabulary mapping is included here, so we can use the checkpoint 
         end
 	print('Saving current checkpoint to:', model_save_filename)
 
