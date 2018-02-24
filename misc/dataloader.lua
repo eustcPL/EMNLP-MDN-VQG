@@ -22,16 +22,27 @@ function dataloader:initialize(opt)
          if opt['input_img_train_h5'] ~= nil then
                 print('Reading DataLoader loading h5 image file:' .. opt['input_img_train_h5'])
                 self.h5_img_file_train = hdf5.open(opt['input_img_train_h5'], 'r')
-                --for Knn feat
-                print('Reading DataLoader loading h5 image file:' .. opt['knn_idx_value_train_input'])
+               
+               --for Knn feat
+                print('Reading DataLoader knn loading h5 image file:' .. opt['knn_idx_value_train_input'])
                 self.knn_train_index_list = hdf5.open(opt['knn_idx_value_train_input'], 'r')
+
+                -- --for caption feat, total 3.7k caption feat are present which is same as total number of image
+                -- print('Reading DataLoader loading h5 image file:' .. opt['input_cap_train_h5'])
+                -- self.h5_cap_file_train = hdf5.open(opt['input_cap_train_h5'], 'r')
+
         end
         if opt['input_img_test_h5'] ~= nil then
                 print('Reading  DataLoader loading h5 image file: ' .. opt['input_img_test_h5'])
                 self.h5_img_file_test  = hdf5.open(opt['input_img_test_h5'], 'r')
+               
                 --for Knn feat
                 print('Reading DataLoader loading h5 Knn  file:' .. opt['knn_idx_value_test_input'])
                 self.knn_test_index_list = hdf5.open(opt['knn_idx_value_test_input'], 'r')
+
+                -- --for caption feat, total 1.25k caption feat are present which is same as total number of image
+                -- print('Reading DataLoader loading h5 image file:' .. opt['input_cap_test_h5'])
+                -- self.h5_cap_file_test = hdf5.open(opt['input_cap_test_h5'], 'r')
         end
 
 ----------------------------------------------------------------------------------------------------------
@@ -79,9 +90,6 @@ function dataloader:initialize(opt)
                 self['test_id']   = 1
                 -- to print complete size of each split
                 print('self[ques_test]:size(1)',self['ques_test']:size(1))
-                
-                
-                
         --end
         qa_data:close()
 end
@@ -107,14 +115,14 @@ function dataloader:next_batch(opt)
     local iminds_R = torch.LongTensor(end_id - start_id + 1):fill(0)-- to keep track of  question index
     local iminds_NR = torch.LongTensor(end_id - start_id + 1):fill(0)-- to keep track of  question index
 
-    local im_R    = torch.LongTensor(opt.batch_size, 4096):fill(0)   --14, 14, 512):fill(0)  --chanaged for fc7 -- for store img batch of size 14x14x512 changed to 4096
-    local im_NR    = torch.LongTensor(opt.batch_size, 4096):fill(0)   --14, 14, 512):fill(0)  --chanaged for fc7 -- for store img batch of size 14x14x512 changed to 4096
+    local im_R    = torch.LongTensor(opt.batch_size, 4096):fill(0)   --14, 14, 512):fill(0)for attention  --chanaged to 4096 for fc7  -- for store img batch of size 14x14x512 changed to 4096
+    local im_NR    = torch.LongTensor(opt.batch_size, 4096):fill(0)   --14, 14, 512):fill(0)for attention  --chanaged to 4096 for fc7 -- for store img batch of size 14x14x512 changed to 4096
     
-    --k=2
-    local iminds_R2 = torch.LongTensor(end_id - start_id + 1):fill(0)-- to keep track of  question index
-    local iminds_NR2 = torch.LongTensor(end_id - start_id + 1):fill(0)-- to keep track of  question index
-    local im_R2    = torch.LongTensor(opt.batch_size, 4096):fill(0)   --14, 14, 512):fill(0)  --chanaged for fc7 -- for store img batch of size 14x14x512 changed to 4096
-    local im_NR2    = torch.LongTensor(opt.batch_size, 4096):fill(0)   --14, 14, 512):fill(0)  --chanaged for fc7 -- for store img batch of size 14x14x512 changed to 4096
+
+    local capinds_R = torch.LongTensor(end_id - start_id + 1):fill(0)-- to keep track of  Caption index
+    local capinds_NR = torch.LongTensor(end_id - start_id + 1):fill(0)-- to keep track of  Caption index
+    local cap_R    = torch.LongTensor(opt.batch_size, 26):fill(0)   --26 sequence length --chanaged for caption -- for store img batch of size 14x14x512 changed to 4096
+    local cap_NR    = torch.LongTensor(opt.batch_size, 26):fill(0)  --26 sequence length --chanaged for caption -- for store img batch of size 14x14x512 changed to 4096
 
     local batch_knn_train_index_list = torch.LongTensor(opt.batch_size, 200):fill(0)
     local iter = torch.LongTensor(end_id - start_id + 1):fill(0) -- to keep track of  question index
@@ -129,48 +137,44 @@ function dataloader:next_batch(opt)
         --------------------------------------------------------------
         --to find one batch 
         iter[i] = start_id + i - 1               -- this  is for sequential
-        iminds_knn[i] = self['im_list_train'][iter[i]]                 -- extract image id from image list  
+        iminds_knn[i] = self['im_list_train'][iter[i]]        -- extract image id from image list  
         batch_knn_train_index_list[i]=self.knn_train_index_list:read('/images_train'):partial(iminds_knn[i],{1,200})
-        --print("iminds_R[i]",iminds_R[i], "i", i, "iter[i]",iter[i],"iminds_knn[i]",iminds_knn[i])
-        
+       
         iminds_R[i] = batch_knn_train_index_list[i][2]                -- extract image id from image list
         iminds_NR[i] = batch_knn_train_index_list[i][200]               -- extract image id from image list  
         
         im_R[i] =  self.h5_img_file_train:read('/images_train'):partial({iminds_R[i],iminds_R[i]},{1,4096})         --{1,14},{1,14},{1,512}) --chanaged for fc7
         im_NR[i] =  self.h5_img_file_train:read('/images_train'):partial({iminds_NR[i],iminds_NR[i]},{1,4096})      --{1,14},{1,14},{1,512}) --chanaged for fc7
         
+
+        --   --2 for caption
+        -- capinds_R[i] = batch_knn_train_index_list[i][2]                -- extract image id from image list
+        -- capinds_NR[i] = batch_knn_train_index_list[i][200]               -- extract image id from image list  
+        -- cap_R[i] =  self.h5_cap_file_train:read('/images_train'):partial({capinds_R[i],capinds_R[i]},{1,26})         --{1,14},{1,14},{1,512}) --chanaged for fc7
+        -- cap_NR[i] =  self.h5_cap_file_train:read('/images_train'):partial({capinds_NR[i],capinds_NR[i]},{1,26})      --{1,14},{1,14},{1,512}) --chanaged for fc7
         
-        --k=2
-        iminds_R2[i] = batch_knn_train_index_list[i][3]                -- extract image id from image list
-        iminds_NR2[i] = batch_knn_train_index_list[i][199]               -- extract image id from image list  
-        im_R2[i] =  self.h5_img_file_train:read('/images_train'):partial({iminds_R2[i],iminds_R2[i]},{1,4096})         --{1,14},{1,14},{1,512}) --chanaged for fc7
-        im_NR2[i] =  self.h5_img_file_train:read('/images_train'):partial({iminds_NR2[i],iminds_NR2[i]},{1,4096})      --{1,14},{1,14},{1,512}) --chanaged for fc7
-        
-        --------------------------------------------------------------
-        
+        --------------------------------------------------------------       
     end
 
-    --local im = self['fv_im']:index(1, iminds)
     local ques    = self['ques_train']:index(1, qinds)
-    --local labels  = self['ans_train']:index(1, qinds)
     local cap     = self['cap_train']:index(1, qinds)
     local ques_id = self['ques_id_train']:index(1, qinds)
 
     if opt.gpuid >= 0 then
         im     = im:cuda()
         ques   = ques:cuda()        
-        --labels = labels:cuda()
         cap    = cap:cuda()
-        im_R    = im_R:cuda()
-        im_NR     = im_NR:cuda()
-        
-        --k=2
-        im_R2    = im_R2:cuda()
-        im_NR2     = im_NR2:cuda()
+        im_R   = im_R:cuda()
+        im_NR  = im_NR:cuda()
+
+        --2 for caption
+        cap_R  = cap:cuda() -- for caption related input
+        cap_NR = cap:cuda() -- for caption  non related input
+
     end
 
         self['train_id'] = self['train_id'] + end_id - start_id + 1   -- self['test_id']=  self.test_id both have same meaning
-    return {im, ques,cap,ques_id,im_R,im_NR,im_R2,im_NR2}
+    return {im, ques,cap,ques_id,im_R,im_NR,cap_R,cap_NR}
 end
 
 function dataloader:next_batch_eval(opt)
@@ -187,20 +191,16 @@ function dataloader:next_batch_eval(opt)
         im[i] = self.h5_img_file_test:read('/images_test'):partial({iminds[i],iminds[i]},{1,4096}) --{1,14},{1,14},{1,512}) --chanaged for fc7
     end
 
-    -- print('Ques_cap_id BEFORE',self['ques_id_test'])
-    --local im = self['fv_im']:index(1, iminds)
+
     local ques    = self['ques_test']:index(1, qinds)
     local ques_id = self['ques_id_test']:index(1, qinds)
-    -- local labels  = self['ans_test']:index(1, qinds)
     local cap     = self['cap_test']:index(1, qinds)
 
     if opt.gpuid >= 0 then
         im     = im:cuda()
         ques   = ques:cuda()
-        --labels =labels:cuda()
         cap    = cap:cuda()
     end
-    -- print('Ques_cap_id AFTER',ques_id)
     self['test_id'] = self['test_id'] + end_id - start_id + 1   -- self['test_id']=  self.test_id both have same meaning
 
     return {im, ques, ques_id,cap}
